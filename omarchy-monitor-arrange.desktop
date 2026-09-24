@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Monitor Arrangement
+GenericName=Display Configuration
+Comment=Arrange, scale and rotate monitors by dragging them
+Exec=omarchy-monitor-arrange
+Icon=preferences-desktop-display
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=monitor;display;screen;resolution;scale;arrange;hyprland;
+StartupWMClass=org.omarchy.MonitorArrange

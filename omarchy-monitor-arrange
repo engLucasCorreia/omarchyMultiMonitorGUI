@@ -1,0 +1,712 @@
+#!/usr/bin/env python3
+"""Drag-and-drop monitor arrangement for Omarchy / Hyprland.
+
+Detects monitors via hyprctl, lets you drag them around a canvas with edge
+snapping, applies the layout live, and writes ~/.config/hypr/monitors.lua.
+"""
+
+import json
+import math
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import GLib, Gtk  # noqa: E402
+import cairo  # noqa: E402
+
+MONITORS_LUA = Path.home() / ".config/hypr/monitors.lua"
+MODE_RE = re.compile(r"^(\d+)x(\d+)@([\d.]+)Hz$")
+SCALES = [1.0, 1.2, 1.25, 4 / 3, 1.5, 1.6, 1.75, 2.0, 2.5, 3.0]
+ROTATIONS = [("Landscape", 0), ("Portrait (90°)", 1), ("Landscape flipped (180°)", 2), ("Portrait (270°)", 3)]
+SNAP_PX = 24  # snap distance in *screen* pixels, so it feels constant at any zoom
+# Built-in laptop panels, matched the way omarchy-hyprland-monitor-laptop does.
+INTERNAL_RE = re.compile(r"^(eDP|LVDS|DSI)-")
+# The scale Omarchy's lid handler remembers when it switches the panel off.
+INTERNAL_SCALE_STATE = Path.home() / ".local/state/omarchy/toggles/hypr/internal-monitor-scale"
+
+C_BG = (0.13, 0.14, 0.17)
+C_GRID = (0.18, 0.19, 0.23)
+C_FILL = (0.23, 0.25, 0.31)
+C_FILL_SEL = (0.20, 0.42, 0.85)
+C_EDGE = (0.42, 0.45, 0.52)
+C_EDGE_SEL = (0.55, 0.72, 1.00)
+C_TEXT = (0.90, 0.91, 0.94)
+C_DIM = (0.48, 0.50, 0.56)
+
+
+def hyprctl(args, json_out=False):
+    cmd = ["hyprctl"] + (["-j"] if json_out else []) + args
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        raise RuntimeError((p.stderr or p.stdout).strip() or f"{' '.join(cmd)} failed")
+    return json.loads(p.stdout) if json_out else p.stdout.strip()
+
+
+def fmt_num(v):
+    """Format a float the way a human would write it in a config file."""
+    return str(int(round(v))) if abs(v - round(v)) < 1e-6 else f"{v:.8f}".rstrip("0").rstrip(".")
+
+
+def configured_rules():
+    """Each output's settings in monitors.lua, keyed by name. Hyprland reports
+    no mode or scale for a disabled screen, so these are what it comes back on
+    with."""
+    rules = {}
+    try:
+        text = MONITORS_LUA.read_text()
+    except OSError:
+        return rules
+    for line in text.splitlines():
+        found = re.match(r"\s*hl\.monitor\(\{(.*)\}\)", line.split("--", 1)[0])
+        if not found:
+            continue
+        fields = {k: v.strip('"') for k, v in re.findall(r'(\w+)\s*=\s*("[^"]*"|[^,\s}]+)', found.group(1))}
+        if fields.get("output"):
+            rules[fields["output"]] = fields
+    return rules
+
+
+class Monitor:
+    def __init__(self, j):
+        self.name = j["name"]
+        self.desc = j.get("description", "")
+        self.enabled = not j.get("disabled", False)
+        self.scale = float(j.get("scale", 1) or 1)
+        self.transform = int(j.get("transform", 0) or 0)
+        self.internal = bool(INTERNAL_RE.match(self.name))
+        # Save hands the laptop panel's on/off to Omarchy only when it was
+        # flipped here, so a panel that is off because the lid is shut is not
+        # pinned off for when the lid opens while docked.
+        self.loaded_enabled = self.enabled
+
+        seen, self.modes = set(), []
+        for s in j.get("availableModes", []):
+            m = MODE_RE.match(s)
+            if not m:
+                continue
+            w, h, rr = int(m.group(1)), int(m.group(2)), float(m.group(3))
+            key = (w, h, round(rr, 2))
+            if key not in seen:
+                seen.add(key)
+                self.modes.append((w, h, rr))
+        self.modes.sort(key=lambda m: (m[0] * m[1], m[2]), reverse=True)
+        if not self.modes:
+            self.modes = [(1920, 1080, 60.0)]
+
+        if self.enabled and j.get("width"):
+            self.mode = self._closest(int(j["width"]), int(j["height"]), float(j.get("refreshRate", 60)))
+            self.x, self.y = int(j.get("x", 0)), int(j.get("y", 0))
+        else:
+            self.mode = self.modes[0]
+            self.x, self.y = 0, 0
+
+    def _closest(self, w, h, rr):
+        same = [m for m in self.modes if m[0] == w and m[1] == h]
+        if same:
+            return min(same, key=lambda m: abs(m[2] - rr))
+        self.modes.insert(0, (w, h, rr))
+        return self.modes[0]
+
+    def restore(self, rule):
+        """Take the mode, scale and rotation a disabled screen is configured to
+        come back on with."""
+        found = MODE_RE.match(rule.get("mode", "") + "Hz")
+        if found:
+            self.mode = self._closest(int(found.group(1)), int(found.group(2)), float(found.group(3)))
+        remembered = None
+        if self.internal:
+            try:
+                remembered = INTERNAL_SCALE_STATE.read_text().strip()
+            except OSError:
+                pass
+        # A scale naming a Lua local rather than a number falls through.
+        for scale in (rule.get("scale"), remembered):
+            try:
+                self.scale = float(scale)
+                break
+            except (TypeError, ValueError):
+                continue
+        try:
+            self.transform = int(rule.get("transform", self.transform))
+        except ValueError:
+            pass
+
+    @property
+    def rotated(self):
+        return self.transform in (1, 3, 5, 7)
+
+    def size(self):
+        """Logical (scaled, rotated) size — what Hyprland lays out."""
+        w = int(round(self.mode[0] / self.scale))
+        h = int(round(self.mode[1] / self.scale))
+        return (h, w) if self.rotated else (w, h)
+
+    def valid_scales(self):
+        out = []
+        for s in SCALES:
+            if abs(self.mode[0] / s - round(self.mode[0] / s)) < 1e-3 and \
+               abs(self.mode[1] / s - round(self.mode[1] / s)) < 1e-3:
+                out.append(s)
+        if not any(abs(s - self.scale) < 1e-6 for s in out):
+            out.append(self.scale)
+        return sorted(out)
+
+    def mode_str(self):
+        return f"{self.mode[0]}x{self.mode[1]}@{self.mode[2]:.2f}"
+
+    def lua(self, saving=False):
+        # A laptop panel is never saved as disabled: that outlives the dock, so
+        # undocking would leave no screen on at all. It is saved with the
+        # settings it comes back on with, and "off while docked" is Omarchy's
+        # internal-monitor toggle, which clears itself once no external screen
+        # is active. Apply (not saving) may still switch it off live.
+        if not self.enabled and not (saving and self.internal):
+            return f'hl.monitor({{ output = "{self.name}", disabled = true }})'
+        position = f"{self.x}x{self.y}" if self.enabled else "auto"
+        s = (f'hl.monitor({{ output = "{self.name}", mode = "{self.mode_str()}", '
+             f'position = "{position}", scale = {fmt_num(self.scale)}')
+        if self.transform:
+            s += f", transform = {self.transform}"
+        return s + " })"
+
+
+class Canvas(Gtk.DrawingArea):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.zoom = 0.1
+        self.ox = self.oy = 0.0
+        self.drag = None
+        self.set_draw_func(self.on_draw)
+
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self.on_begin)
+        drag.connect("drag-update", self.on_update)
+        drag.connect("drag-end", self.on_end)
+        self.add_controller(drag)
+
+    # --- coordinate helpers -------------------------------------------------
+    def fit(self, width, height):
+        mons = self.app.mons
+        if not mons:
+            self.zoom, self.ox, self.oy = 0.1, 0, 0
+            return
+        x0 = min(m.x for m in mons)
+        y0 = min(m.y for m in mons)
+        x1 = max(m.x + m.size()[0] for m in mons)
+        y1 = max(m.y + m.size()[1] for m in mons)
+        pad = 40
+        self.zoom = min((width - 2 * pad) / max(x1 - x0, 1), (height - 2 * pad) / max(y1 - y0, 1), 0.35)
+        self.ox = (width - (x1 - x0) * self.zoom) / 2 - x0 * self.zoom
+        self.oy = (height - (y1 - y0) * self.zoom) / 2 - y0 * self.zoom
+
+    def to_screen(self, m):
+        w, h = m.size()
+        return (m.x * self.zoom + self.ox, m.y * self.zoom + self.oy, w * self.zoom, h * self.zoom)
+
+    def hit(self, px, py):
+        for m in reversed(self.app.draw_order()):
+            x, y, w, h = self.to_screen(m)
+            if x <= px <= x + w and y <= py <= y + h:
+                return m
+        return None
+
+    # --- drawing ------------------------------------------------------------
+    def on_draw(self, area, cr, width, height, *_):
+        cr.set_source_rgb(*C_BG)
+        cr.paint()
+        if not self.app.mons:
+            return
+        if self.drag is None:
+            self.fit(width, height)
+
+        cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        for m in self.app.draw_order():
+            sel = m is self.app.selected
+            x, y, w, h = self.to_screen(m)
+            r = min(6, w / 6, h / 6)
+
+            cr.new_path()
+            cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+            cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+            cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+            cr.arc(x + r, y + r, r, math.pi, 1.5 * math.pi)
+            cr.close_path()
+
+            cr.set_source_rgb(*(C_FILL_SEL if sel else (C_FILL if m.enabled else C_GRID)))
+            cr.fill_preserve()
+            cr.set_line_width(2 if sel else 1.5)
+            cr.set_source_rgb(*(C_EDGE_SEL if sel else C_EDGE))
+            cr.set_dash([] if m.enabled else [5, 4])
+            cr.stroke()
+            cr.set_dash([])
+
+            lines = [m.name]
+            if m.enabled:
+                lw, lh = m.size()
+                lines.append(f"{lw}×{lh}")
+                lines.append(f"{m.mode[2]:.0f} Hz · {fmt_num(m.scale)}x")
+            else:
+                lines.append("off while docked" if m.internal else "disabled")
+            self.label(cr, x + w / 2, y + h / 2, lines, m.enabled or sel, w, h)
+
+    def label(self, cr, cx, cy, lines, bright, box_w, box_h):
+        """Draw as many of the lines as actually fit inside the tile."""
+        sizes = [15, 12, 11]
+        fitted = []
+        for i, text in enumerate(lines):
+            size = sizes[min(i, 2)]
+            cr.set_font_size(size)
+            if cr.text_extents(text).width <= box_w - 8:
+                fitted.append((size, text))
+        while fitted and sum(sz * 1.35 for sz, _ in fitted) > box_h - 6:
+            fitted.pop()
+
+        ty = cy - sum(sz * 1.35 for sz, _ in fitted) / 2
+        for size, text in fitted:
+            cr.set_font_size(size)
+            cr.set_source_rgb(*(C_TEXT if bright else C_DIM))
+            ext = cr.text_extents(text)
+            ty += size * 1.35
+            cr.move_to(cx - ext.width / 2 - ext.x_bearing, ty - size * 0.35)
+            cr.show_text(text)
+
+    # --- dragging -----------------------------------------------------------
+    def on_begin(self, gesture, sx, sy):
+        m = self.hit(sx, sy)
+        if m:
+            self.app.select(m)
+            self.drag = (m, m.x, m.y)
+        else:
+            self.drag = None
+        self.queue_draw()
+
+    def on_update(self, gesture, dx, dy):
+        if not self.drag:
+            return
+        m, x0, y0 = self.drag
+        m.x, m.y = self.snap(m, x0 + dx / self.zoom, y0 + dy / self.zoom)
+        self.queue_draw()
+
+    def on_end(self, gesture, dx, dy):
+        if self.drag:
+            self.app.normalize()
+            self.app.mark_dirty()
+        self.drag = None
+        self.queue_draw()
+
+    def snap(self, m, nx, ny):
+        w, h = m.size()
+        thr = SNAP_PX / self.zoom
+        xs, ys = [0.0], [0.0]
+        for o in self.app.mons:
+            if o is m or not o.enabled:
+                continue
+            ow, oh = o.size()
+            xs += [o.x, o.x + ow, o.x - w, o.x + ow - w, o.x + (ow - w) / 2]
+            ys += [o.y, o.y + oh, o.y - h, o.y + oh - h, o.y + (oh - h) / 2]
+        for cands, val in ((xs, nx), (ys, ny)):
+            best = min(cands, key=lambda c: abs(c - val))
+            if abs(best - val) <= thr:
+                if cands is xs:
+                    nx = best
+                else:
+                    ny = best
+        return int(round(nx)), int(round(ny))
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="org.omarchy.MonitorArrange")
+        self.mons = []
+        self.selected = None
+        self.dirty = False
+        self._sync = False
+        self._rebuild_id = 0
+
+    def do_activate(self):
+        self.win = Gtk.ApplicationWindow(application=self, title="Monitor Arrangement")
+        self.win.set_default_size(1240, 680)
+
+        header = Gtk.HeaderBar()
+        self.win.set_titlebar(header)
+        for label, cb, css in (("Detect", self.on_detect, None),
+                               ("Revert", self.on_revert, None)):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", cb)
+            header.pack_start(b)
+        for label, cb, css in (("Save", self.on_save, "suggested-action"),
+                               ("Apply", self.on_apply, None)):
+            b = Gtk.Button(label=label)
+            b.connect("clicked", cb)
+            if css:
+                b.add_css_class(css)
+            header.pack_end(b)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.win.set_child(root)
+
+        split = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True)
+        root.append(split)
+
+        self.canvas = Canvas(self)
+        self.canvas.set_hexpand(True)
+        self.canvas.set_size_request(480, 320)
+        split.append(self.canvas)
+        split.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+
+        # propagate_natural_width=False pins the sidebar to its size request so
+        # long monitor descriptions cannot squeeze the canvas.
+        side = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                  vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+                                  propagate_natural_width=False, hexpand=False)
+        side.set_size_request(300, -1)
+        side.set_child(self.build_panel())
+        split.append(side)
+
+        self.status = Gtk.Label(xalign=0, margin_start=12, margin_end=12, margin_top=6, margin_bottom=6)
+        self.status.add_css_class("dim-label")
+        root.append(Gtk.Separator())
+        root.append(self.status)
+
+        self.load()
+        self.win.present()
+
+    def build_panel(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                      margin_top=14, margin_bottom=14, margin_start=14, margin_end=14)
+        box.set_size_request(280, -1)
+
+        self.title = Gtk.Label(xalign=0)
+        self.title.add_css_class("title-4")
+        self.subtitle = Gtk.Label(xalign=0, wrap=True, max_width_chars=30)
+        self.subtitle.add_css_class("dim-label")
+        box.append(self.title)
+        box.append(self.subtitle)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8, margin_top=8)
+        row.append(Gtk.Label(label="Enabled", xalign=0, hexpand=True))
+        self.sw_enabled = Gtk.Switch(halign=Gtk.Align.END)
+        self.sw_enabled.connect("notify::active", self.on_enabled)
+        row.append(self.sw_enabled)
+        box.append(row)
+
+        def dropdown(label, handler):
+            box.append(Gtk.Label(label=label, xalign=0, margin_top=6))
+            dd = Gtk.DropDown.new_from_strings([""])
+            dd.connect("notify::selected", handler)
+            box.append(dd)
+            return dd
+
+        self.dd_mode = dropdown("Resolution", self.on_mode)
+        self.dd_scale = dropdown("Scale", self.on_scale)
+        self.dd_rot = dropdown("Rotation", self.on_rot)
+
+        box.append(Gtk.Label(label="Position", xalign=0, margin_top=6))
+        self.pos = Gtk.Label(xalign=0)
+        self.pos.add_css_class("dim-label")
+        box.append(self.pos)
+
+        hint = Gtk.Label(xalign=0, wrap=True, max_width_chars=34, margin_top=14,
+                         label="Drag a screen to move it. Edges snap to neighbours.\n"
+                               "Apply tests the layout live; Save writes monitors.lua\n"
+                               "and reloads Hyprland. Revert restores the saved config.\n"
+                               "A laptop panel switched off stays off only while\n"
+                               "docked; it comes back on when undocked.")
+        hint.add_css_class("dim-label")
+        box.append(hint)
+        return box
+
+    # --- state --------------------------------------------------------------
+    def load(self):
+        try:
+            data = hyprctl(["monitors", "all"], json_out=True)
+        except Exception as e:
+            self.set_status(f"Cannot talk to Hyprland: {e}")
+            return
+        self.mons = [Monitor(m) for m in data]
+        rules = configured_rules()
+        for m in self.mons:
+            if not m.enabled:
+                m.restore(rules.get(m.name, {}))
+        self.park_disabled()
+        self.normalize()
+        self.selected = next((m for m in self.mons if m.enabled), self.mons[0] if self.mons else None)
+        self.dirty = False
+        self.sync_panel()
+        self.canvas.queue_draw()
+        self.set_status(f"{len(self.mons)} monitor(s) detected.")
+
+    def normalize(self):
+        """Anchor the enabled layout at 0,0 (Hyprland's origin) without
+        disturbing where parked/disabled screens sit relative to it."""
+        ref = [m for m in self.mons if m.enabled] or self.mons
+        if not ref:
+            return
+        dx = min(m.x for m in ref)
+        dy = min(m.y for m in ref)
+        for m in self.mons:
+            m.x -= dx
+            m.y -= dy
+
+    def park_disabled(self):
+        """Disabled screens have no position of their own, so lay them out in a
+        row below the active layout instead of piling up on the origin."""
+        off = [m for m in self.mons if not m.enabled]
+        if not off:
+            return
+        on = [m for m in self.mons if m.enabled]
+        x = min(m.x for m in on) if on else 0
+        y = max(m.y + m.size()[1] for m in on) + 160 if on else 0
+        for m in off:
+            m.x, m.y = int(x), int(y)
+            x += m.size()[0] + 160
+
+    def draw_order(self):
+        """Disabled at the back, selected on top."""
+        rest = [m for m in self.mons if m is not self.selected]
+        order = [m for m in rest if not m.enabled] + [m for m in rest if m.enabled]
+        return order + ([self.selected] if self.selected in self.mons else [])
+
+    def overlaps(self):
+        on = [m for m in self.mons if m.enabled]
+        pairs = []
+        for i, a in enumerate(on):
+            aw, ah = a.size()
+            for b in on[i + 1:]:
+                bw, bh = b.size()
+                if a.x < b.x + bw and b.x < a.x + aw and a.y < b.y + bh and b.y < a.y + ah:
+                    pairs.append(f"{a.name}/{b.name}")
+        return pairs
+
+    def select(self, m):
+        self.selected = m
+        self.sync_panel()
+
+    def mark_dirty(self):
+        self.dirty = True
+        self.sync_panel(rebuild=False)
+        bad = self.overlaps()
+        if bad:
+            self.set_status("Screens overlap: " + ", ".join(bad) + " - Hyprland needs them side by side.")
+        else:
+            self.set_status("Unsaved layout. Apply to test it live, Save to keep it.")
+
+    def sync_panel(self, rebuild=True):
+        """Refresh the sidebar. Pass rebuild=False when only values changed and
+        the dropdown contents are still valid."""
+        m = self.selected
+        self._sync = True
+        try:
+            if not m:
+                self.title.set_text("No monitor")
+                return
+            self.title.set_text(m.name)
+            self.subtitle.set_text(m.desc or "")
+            self.sw_enabled.set_active(m.enabled)
+            # A disabled laptop panel keeps its settings editable: they are
+            # what it switches back on with when undocked.
+            for w in (self.dd_mode, self.dd_scale, self.dd_rot):
+                w.set_sensitive(m.enabled or m.internal)
+            self.pos.set_text(f"{m.x}, {m.y}" if m.enabled else "—")
+        finally:
+            self._sync = False
+        if rebuild:
+            self.queue_rebuild()
+
+    def queue_rebuild(self):
+        """Replacing a Gtk.DropDown model from inside a DropDown signal handler
+        deadlocks GTK4, so model rebuilds always run from an idle callback."""
+        if not self._rebuild_id:
+            self._rebuild_id = GLib.idle_add(self._rebuild_models)
+
+    def _rebuild_models(self):
+        self._rebuild_id = 0
+        m = self.selected
+        if not m:
+            return False
+        self._sync = True
+        try:
+            modes = [f"{w}×{h} @ {rr:.2f} Hz" for w, h, rr in m.modes]
+            self.dd_mode.set_model(Gtk.StringList.new(modes))
+            self.dd_mode.set_selected(m.modes.index(m.mode))
+
+            self._scales = m.valid_scales()
+            labels = []
+            for sc in self._scales:
+                lw, lh = int(round(m.mode[0] / sc)), int(round(m.mode[1] / sc))
+                labels.append(f"{fmt_num(sc)}x  ({lw}×{lh})")
+            self.dd_scale.set_model(Gtk.StringList.new(labels))
+            self.dd_scale.set_selected(min(range(len(self._scales)),
+                                           key=lambda i: abs(self._scales[i] - m.scale)))
+
+            self.dd_rot.set_model(Gtk.StringList.new([n for n, _ in ROTATIONS]))
+            self.dd_rot.set_selected(next((i for i, (_, t) in enumerate(ROTATIONS) if t == m.transform), 0))
+        finally:
+            self._sync = False
+        return False
+
+    # --- panel callbacks ----------------------------------------------------
+    def on_enabled(self, sw, _p):
+        # _rebuild_id set means the dropdown models do not describe the
+        # current selection yet, so their indices are not meaningful.
+        if self._sync or self._rebuild_id or not self.selected:
+            return
+        m = self.selected
+        m.enabled = sw.get_active()
+        others = [o for o in self.mons if o.enabled and o is not m]
+        if m.enabled and others and self.overlaps():
+            m.x = max(o.x + o.size()[0] for o in others)
+            m.y = min(o.y for o in others)
+        elif not m.enabled:
+            self.park_disabled()
+        self.normalize()
+        self.mark_dirty()
+        self.canvas.queue_draw()
+
+    def on_mode(self, dd, _p):
+        # _rebuild_id set means the dropdown models do not describe the
+        # current selection yet, so their indices are not meaningful.
+        if self._sync or self._rebuild_id or not self.selected:
+            return
+        self.selected.mode = self.selected.modes[dd.get_selected()]
+        if not any(abs(s - self.selected.scale) < 1e-6 for s in self.selected.valid_scales()):
+            self.selected.scale = 1.0
+        self.mark_dirty()
+        self.queue_rebuild()
+        self.canvas.queue_draw()
+
+    def on_scale(self, dd, _p):
+        # _rebuild_id set means the dropdown models do not describe the
+        # current selection yet, so their indices are not meaningful.
+        if self._sync or self._rebuild_id or not self.selected:
+            return
+        i = dd.get_selected()
+        if 0 <= i < len(self._scales):
+            self.selected.scale = self._scales[i]
+            self.mark_dirty()
+            self.canvas.queue_draw()
+
+    def on_rot(self, dd, _p):
+        # _rebuild_id set means the dropdown models do not describe the
+        # current selection yet, so their indices are not meaningful.
+        if self._sync or self._rebuild_id or not self.selected:
+            return
+        self.selected.transform = ROTATIONS[dd.get_selected()][1]
+        self.mark_dirty()
+        self.canvas.queue_draw()
+
+    # --- actions ------------------------------------------------------------
+    def set_status(self, text):
+        self.status.set_text(text)
+
+    def apply_live(self):
+        enabled = [m for m in self.mons if m.enabled]
+        if not enabled:
+            self.set_status("Refusing to apply: at least one monitor must stay enabled.")
+            return False
+        bad = self.overlaps()
+        if bad:
+            self.set_status("Refusing to apply: screens overlap (" + ", ".join(bad) + ").")
+            return False
+        try:
+            out = hyprctl(["eval", "\n".join(m.lua() for m in self.mons)])
+        except Exception as e:
+            self.set_status(f"Apply failed: {e}")
+            return False
+        if out.strip().lower() != "ok":
+            self.set_status(f"Hyprland rejected the layout: {out.splitlines()[0]}")
+            return False
+        return True
+
+    def on_apply(self, _b):
+        if self.apply_live():
+            self.set_status("Applied live (not saved). Save to keep it, Revert to undo.")
+
+    def on_revert(self, _b):
+        try:
+            hyprctl(["reload"])
+        except Exception as e:
+            self.set_status(f"Reload failed: {e}")
+            return
+        GLib.timeout_add(400, self._reload_after_revert)
+
+    def _reload_after_revert(self):
+        self.load()
+        self.set_status("Reverted to the saved monitors.lua.")
+        return False
+
+    def on_detect(self, _b):
+        self.load()
+
+    def on_save(self, _b):
+        if not [m for m in self.mons if m.enabled]:
+            self.set_status("Refusing to save: at least one monitor must stay enabled.")
+            return
+        bad = self.overlaps()
+        if bad:
+            self.set_status("Refusing to save: screens overlap (" + ", ".join(bad) + ").")
+            return
+        gdk_scale = "1"
+        if MONITORS_LUA.exists():
+            found = re.search(r"local\s+omarchy_gdk_scale\s*=\s*(\S+)", MONITORS_LUA.read_text())
+            if found:
+                gdk_scale = found.group(1)
+            backup = MONITORS_LUA.with_suffix(f".lua.bak.{int(time.time())}")
+            shutil.copy2(MONITORS_LUA, backup)
+
+        body = "\n".join(m.lua(saving=True) for m in self.mons)
+        MONITORS_LUA.parent.mkdir(parents=True, exist_ok=True)
+        MONITORS_LUA.write_text(f"""-- Written by omarchy-monitor-arrange on {time.strftime('%Y-%m-%d %H:%M')}
+-- Re-run `omarchy-monitor-arrange` to change it, or edit by hand.
+-- See https://wiki.hypr.land/Configuring/Basics/Monitors/
+
+local omarchy_gdk_scale = {gdk_scale}
+
+hl.env("GDK_SCALE", tostring(omarchy_gdk_scale))
+
+-- Fallback for any monitor not listed below
+hl.monitor({{ output = "", mode = "preferred", position = "auto", scale = 1 }})
+
+{body}
+""")
+        try:
+            hyprctl(["reload"])
+            errs = hyprctl(["configerrors"])
+        except Exception as e:
+            self.set_status(f"Saved, but reload failed: {e}")
+            return
+        panel = self.sync_internal_toggle()
+        if errs and "no errors" not in errs.lower():
+            self.set_status(f"Saved, but Hyprland reported: {errs.splitlines()[0]}{panel}")
+        else:
+            self.dirty = False
+            self.set_status(f"Saved to {MONITORS_LUA} and reloaded.{panel}")
+
+    def sync_internal_toggle(self):
+        """Switch a laptop panel flipped here through Omarchy's internal-monitor
+        toggle, which turns it back on by itself when undocked. Returns a
+        status-line suffix."""
+        notes = []
+        for m in self.mons:
+            if not m.internal or m.enabled == m.loaded_enabled:
+                continue
+            action = "on" if m.enabled else "off"
+            p = subprocess.run(["omarchy-hyprland-monitor-internal", action], capture_output=True, text=True)
+            if p.returncode != 0:
+                notes.append(f"Could not switch {m.name} {action}.")
+                continue
+            m.loaded_enabled = m.enabled
+            if not m.enabled:
+                notes.append(f"{m.name} stays off while docked and comes back on when undocked.")
+        return "".join(" " + n for n in notes)
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(None))
