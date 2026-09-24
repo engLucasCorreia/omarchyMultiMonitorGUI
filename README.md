@@ -9,6 +9,9 @@ in Omarchy's Lua config format.
 A single self-contained Python script. No AUR packages, no extra dependencies
 beyond what Omarchy already ships.
 
+![Monitor Arrangement showing four screens on the canvas, with the selected
+screen's resolution, scale and rotation in the side panel](docs/screenshot.png)
+
 ## Features
 
 - **Drag to arrange** — screens snap to their neighbours' edges and centres
